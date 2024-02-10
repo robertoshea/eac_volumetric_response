@@ -1,0 +1,1795 @@
+#alias volumetric response 02_12_23
+
+#set seed
+if(T){
+  set.seed(1)
+}
+
+#import libraries
+if(T){
+  
+  library(abind)
+  library(SILGGM)
+  library(reshape2)
+  library(ggplot2)
+  library(ggpubr)
+}
+
+#utility functions
+if(T){
+  
+  clean_dcm_str <- function(x){
+    x <- gsub(".* \\'", "",  x)
+    x <- gsub(".* \\\"", "",  x)
+    x <- gsub("\\'.*", "",  x)
+    x <- gsub("\\\".*", "",  x)
+    x <- tolower(x)
+    x <- gsub(" ", "_", x)
+    return(x)
+  }
+  
+  fac2 <- function(x, levels=NULL){
+    if(!is.null(levels)){
+      factor(x, exclude=NULL, levels=levels)
+    }else{
+      factor(x, exclude=NULL)
+    }
+  }
+  
+  format_p <- function(x,table=F){
+    x_out <- x
+    x_out[x<0.001]<- "<.001"
+    x_out[0.001<=x&x<0.01]<- round(x[0.001<=x&x<0.01], 3)
+    x_out[0.01<=x&x<0.05]<- round(x[0.01<=x&x<0.05], 2)
+    x_out[0.001<=x&x<0.05] <- paste0("=", substr(x_out[0.001<=x&x<0.05], 2, nchar(x_out[0.001<=x&x<0.05])))
+    x_out[x>=0.05] <- ">.05"
+    if(table){
+      x_out <- gsub("<", "< 0", x_out)
+      x_out <- gsub("=", "0", x_out)
+    }
+    
+    return(x_out)
+  }
+  
+  mse_func <- function(a,b){
+    mean((a-b)^2)
+  }
+  cs_func <- function(a,b){
+    sum(a*b)/sqrt(sum(a^2)*sum(b^2))
+  }
+  
+}
+
+#pre-select model features
+if(T){
+  dcm_meta_vars <- c("acq_scanner_manufacturer", "acq_scanner_model", "acq_voxel_dim",
+                     "acq_slice_thickness","acq_kvp","acq_kernel","acq_xr_current","acq_exposure_time","acq_exposure"
+  )
+  clin_features <- c("age", "female", "clin_t_stage", )
+  rad_features <- c("original_shape_VoxelVolume", "original_shape_SurfaceVolumeRatio")
+  
+}
+
+#data preparation
+if(T){
+  
+  #Clean clinical data
+  if(T){
+    
+    #read in clinical data
+    metadata_dir <- "#"
+    metadata_file <- file.path(metadata_dir,
+                               "query_standard_cohort_2023-02-22.tsv.txt")
+    metadata <- read.delim(metadata_file, stringsAsFactors = F)
+    
+    #concatenate duplicates
+    metadata_list <- lapply(sort(unique(metadata$occams_id)), function(id_i){
+      
+      metadata_i <- metadata[which(metadata$occams_id==id_i),]
+      return(metadata_i[nrow(metadata_i),])
+    })
+    metadata <- do.call(rbind.data.frame, metadata_list)
+    
+    #identifiers
+    patient_id <- substr(metadata$occams_id, 8, nchar(metadata$occams_id))
+    patient_id <- gsub("/", "", patient_id)
+    sha_id <- metadata$sha_id
+    centre <- substr(patient_id, 1,2)
+    diagnosis_date <- as.Date(metadata$RD_DateOfOGCDiagnosis, format = "%d/%m/%Y")
+    
+    #overall survival
+    os_time <- as.matrix(metadata[,c("deceased_survival_days", "last_known_survival_days")])
+    os_time <- rowSums(os_time, na.rm = TRUE)
+    os_event <- !is.na(metadata$deceased_survival_days)
+    os_censor_date <- diagnosis_date+os_time
+    
+    #demographics
+    age <- metadata$DI_ageAtDiagnosis
+    female <- metadata$DI_PatientGender=="female"
+    smoking <- metadata$EX_IsSmoker
+    smoking[smoking==""]<- "unknown"
+    etoh <- metadata$EX_FormerlyOrCurrentlyHeavyDrinker
+    etoh[etoh==""] <- "unknown"
+    bmi <- metadata$EX_CurrentBMI
+    bmi[bmi==-1]<- NA
+    underweight <- (bmi < 18.5)|is.na(bmi)
+    
+    #clinical T stage
+    clin_t_stage <- metadata$PS_TStage_PrimaryTumour_FinalPretreatmentStaging
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_submucosa")] <- 1
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_muscularis_propria",
+                                     "T2")] <- 2
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_adventitia",
+                                     "T3")] <- 3
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_pleura_pericardium_or_diaphragm")] <- 4
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_adjacent_structures")] <- 4
+    clin_t_stage <- as.numeric(clin_t_stage)
+    clin_t_stage_b <- clin_t_stage >=3
+    
+    #clinical N stage
+    clin_n_stage <- metadata$PS_NStage_PrimaryTumour_FinalPretreatmentStaging_TNM7
+    clin_n_stage <- as.numeric(substr(clin_n_stage, 2, 2))
+    clin_n_stage_b <- clin_n_stage > 0
+    
+    #clinical M stage
+    clin_m_stage <- metadata$PS_MStage_PrimaryTumour_FinalPretreatmentStaging
+    clin_m_stage <- suppressWarnings(as.numeric(substr(clin_m_stage, 2,2)))
+    
+    #overall stage
+    overall_stage <- rep(NA, nrow(metadata))
+    overall_stage[clin_m_stage==1]<- "4b"
+    overall_stage[clin_n_stage==3 &is.na(overall_stage)] <- "4a"
+    overall_stage[clin_n_stage==2 &is.na(overall_stage)] <- "4a"
+    overall_stage[
+      metadata$PS_TStage_PrimaryTumour_FinalPretreatmentStaging==
+        "tumour_invades_adjacent_structures" &is.na(overall_stage)] <- "4a"
+    
+    overall_stage[clin_t_stage>=3&is.na(overall_stage)] <- "3"
+    overall_stage[clin_t_stage>=3&is.na(overall_stage)] <- "3"
+    overall_stage[clin_t_stage==2&
+                    clin_n_stage==1
+                  &is.na(overall_stage)] <- "3"
+    overall_stage[clin_t_stage==2
+                  &is.na(overall_stage)] <- "2b"
+    overall_stage[clin_t_stage==1&
+                    clin_n_stage==1&
+                    is.na(overall_stage)] <- "2a"
+    overall_stage[clin_t_stage==1&
+                    is.na(overall_stage)] <- "1"
+    overall_stage <- factor(overall_stage)
+    
+    
+    
+    #pathological T stage
+    path_t_stage <- metadata$RP_TStage_PrimaryTumour
+    path_t_stage_missing <- path_t_stage %in% c("not_recorded",
+                                                "")
+    path_t_stage[path_t_stage_missing] <- NA  # absent imputed as t4
+    path_t_stage[path_t_stage %in% c("no_evidence_of_primary_tumour",
+                                     "T0")] <- 0
+    path_t_stage[path_t_stage %in% c("tumour_invades_submucosa",
+                                     "tumour_invades_lamina_propria_or_muscularis_mucosae",
+                                     "tumour_invades_lamina_propria_muscularis_mucosae_or_submucosa",
+                                     "T1",
+                                     "T1a",
+                                     "T1b")] <- 1
+    path_t_stage[path_t_stage %in% c("tumour_invades_muscularis_propria",
+                                     "T2")] <- 2
+    path_t_stage[path_t_stage %in% c("tumour_invades_adventitia",
+                                     "T3")] <- 3
+    path_t_stage[path_t_stage %in% c("tumour_invades_pleura_pericardium_or_diaphragm",
+                                     "tumour_invades_adjacent_structures",
+                                     "tumour_invades_other_adjacent_structures_such_as_aorta_vertebral_body_or_trachea",
+                                     "T4a")] <- 4
+    path_t_stage <- as.numeric(path_t_stage)
+    
+    #path N stage
+    path_n_stage <- paste0(metadata$RP_Nstage_RP_TNM6,
+                           metadata$RP_Nstage_RP_TNM7)
+    path_n_stage_missing <- path_n_stage==""
+    path_n_stage[path_n_stage_missing] <- NA
+    path_n_stage <- as.numeric(substr(path_n_stage, 2, 2))
+    
+    #management
+    metadata$TP_PalliativeAntiCancerTreatmentModality[metadata$TP_PalliativeAntiCancerTreatmentModality=="unknown"] <- ""
+    treatment_modality <- paste0(
+      metadata$TP_CurativeTreatmentModality,
+      metadata$TP_PalliativeAntiCancerTreatmentModality
+    )
+    
+    # surgery
+    underwent_surgery <- metadata$#_MainSurgery=="yes"
+    
+    #chemotherapy
+    #removed
+    
+    
+    #pathological T stage
+    path_t_stage <- metadata$RP_TStage_PrimaryTumour
+    path_t_stage_missing <- path_t_stage %in% c("not_recorded",
+                                                "")
+    path_t_stage[path_t_stage_missing] <- NA  # absent imputed as t4
+    path_t_stage[path_t_stage %in% c("no_evidence_of_primary_tumour",
+                                     "T0")] <- 0
+    path_t_stage[path_t_stage %in% c("tumour_invades_submucosa",
+                                     "tumour_invades_lamina_propria_or_muscularis_mucosae",
+                                     "tumour_invades_lamina_propria_muscularis_mucosae_or_submucosa",
+                                     "T1",
+                                     "T1a",
+                                     "T1b")] <- 1
+    path_t_stage[path_t_stage %in% c("tumour_invades_muscularis_propria",
+                                     "T2")] <- 2
+    path_t_stage[path_t_stage %in% c("tumour_invades_adventitia",
+                                     "T3")] <- 3
+    path_t_stage[path_t_stage %in% c("tumour_invades_pleura_pericardium_or_diaphragm",
+                                     "tumour_invades_adjacent_structures",
+                                     "tumour_invades_other_adjacent_structures_such_as_aorta_vertebral_body_or_trachea",
+                                     "T4a")] <- 4
+    path_t_stage <- as.numeric(path_t_stage)
+    path_t_stage_b <- path_t_stage >=3
+    
+    #path N stage
+    path_n_stage <- paste0(metadata$RP_Nstage_RP_TNM6,
+                           metadata$RP_Nstage_RP_TNM7)
+    path_n_stage_missing <- path_n_stage==""
+    path_n_stage[path_n_stage_missing] <- NA
+    path_n_stage <- as.numeric(substr(path_n_stage, 2, 2))
+    path_n_stage_b <- path_n_stage > 0
+    
+    #lymphvascular invasion
+    path_invasion <- metadata$RP_LymphoVascularInvasion
+    path_invasion_missing <- path_invasion==""
+    path_invasion[path_invasion_missing] <- NA
+    path_invasion <- (path_invasion=="yes")*1
+    
+    #pathological response
+    path_response <- (path_t_stage < clin_t_stage)*1
+    path_response_missing <- is.na(path_response)
+    
+    #lymphvascular invasion
+    path_invasion <- metadata$RP_LymphoVascularInvasion
+    path_invasion_missing <- path_invasion==""
+    path_invasion[path_invasion_missing] <- NA
+    path_invasion <- (path_invasion=="yes")*1
+    
+    #pathological response
+    path_response <- (path_t_stage < clin_t_stage)*1
+    path_response_missing <- is.na(path_response)
+    
+    #mandard
+    mandard_response <- as.numeric(substr(metadata$RP_MandardScoreForResponse, 4,4))
+    
+    #tumour location
+    tumour_location <- metadata$RD_OesophagusSite
+    tumour_location[tumour_location=="lower third"]<- "Oesophagus Lower"
+    tumour_location[tumour_location=="middle third"]<- "Oesophagus Middle"
+    tumour_location[tumour_location=="upper third"]<- "Oesophagus Upper"
+    siewert <-  metadata$RD_SiewertClassification
+    siewert[siewert=="unknown"] <- ""
+    siewert <- paste0("Siewert ", siewert)
+    tumour_location[tumour_location==""]<- siewert[tumour_location==""]
+    tumour_location[tumour_location=="Siewert "]<- "Unknown"
+    combined_tumour_site <- metadata$RD_CombinedTumourSite
+    combined_tumour_site[combined_tumour_site=="GOJ_Siewert:unknown"] <- ""
+    combined_tumour_site[combined_tumour_site==""]<- metadata$RP_PostOpPathCombinedTumourSite[combined_tumour_site==""]
+    combined_tumour_site <- gsub("GOJ_", "", combined_tumour_site)
+    combined_tumour_site <- gsub(":", " ", combined_tumour_site)
+    combined_tumour_site[combined_tumour_site=="Oesophagus lower third"] <- "Oesophagus Lower"
+    combined_tumour_site[combined_tumour_site=="Oesophagus middle third"] <- "Oesophagus Middle"
+    combined_tumour_site[combined_tumour_site=="Oesophagus upper third"] <- "Oesophagus Upper"
+    combined_tumour_site[combined_tumour_site=="Siewert unknown"] <- "Unknown"
+    tumour_location[combined_tumour_site!=""] <- combined_tumour_site[combined_tumour_site!=""]
+    metadata$RD_Stomach[metadata$RD_Stomach==""] <- "Unknown"
+    metadata$RD_Stomach[metadata$RD_Stomach=="cardia"] <- "Siewert 2"
+    metadata$RD_Stomach[metadata$RD_Stomach=="fundus"] <- "Siewert 3"
+    metadata$RD_Stomach[metadata$RD_Stomach=="antrum"] <- "Siewert 3"
+    tumour_location[tumour_location=="Unknown"] <-
+      metadata$RD_Stomach[tumour_location=="Unknown"]
+    ps_siewert <- metadata$PS_SiewertClassification
+    ps_siewert[ps_siewert%in%c("", "unknown")]<- "Unknown"
+    ps_siewert[ps_siewert!="Unknown"] <-
+      paste0("Siewert ",
+             ps_siewert[ps_siewert!="Unknown"])
+    tumour_location[tumour_location=="Unknown"] <- ps_siewert[tumour_location=="Unknown"]
+    
+    clinical_data <- data.frame(
+      pathology="oesophageal adenocarcinoma",
+      patient_id,
+      sha_id,
+      centre,
+      diagnosis_date,
+      age,
+      female,
+      bmi,
+      underweight,
+      smoking,
+      etoh,
+      underwent_surgery,
+      clin_t_stage,
+      clin_t_stage_b,
+      clin_n_stage,
+      clin_n_stage_b,
+      clin_m_stage,
+      overall_stage,
+      path_t_stage,
+      path_t_stage_b,
+      path_n_stage,
+      path_n_stage_b,
+      path_response,
+      os_time,
+      os_event,
+      treatment_modality,
+      chemotherapy_protocol,
+      mandard_response,
+      path_response,
+      tumour_location,
+      stringsAsFactors = F
+    )
+    rownames(clinical_data) <- clinical_data$patient_id
+    
+    initial_patient_count <- length(unique(patient_id))
+    initial_centre_counts <- table(centre)
+    
+    radioclinical_df <- clinical_data
+    radioclinical_df$nonchemorad_patients <- clinical_data$treatment_modality %in% c("surgery only",
+                                                                                     "palliative oncological treatment")
+    
+    
+  }
+  
+  #import ct image acquisition parameters
+  if(T){
+    acq_params_file <- '#'
+    acq_params_df <- read.csv(acq_params_file)[,-1]
+    acq_params_df <- acq_params_df[,!colnames(acq_params_df)=="slice_thickness"]
+    acq_params_df$acq_study_date <- paste0(
+      substr(acq_params_df$acq_study_date,
+             1,4),'-',
+      substr(acq_params_df$acq_study_date,
+             5,6),'-',
+      substr(acq_params_df$acq_study_date,
+             7,8)
+    )
+    acq_params_df$acq_study_date <- as.Date(acq_params_df$acq_study_date, format="%Y-%m-%d")
+    truncation_df <- read.csv('#')[,-1]
+    acq_params_df <- merge.data.frame(acq_params_df, truncation_df, all.x = F, all.y = T)
+    acq_params_df$truncation[is.na(acq_params_df$truncation)] <- F
+    acq_params_df$dataset <- "ALIAS"
+    
+    patients_without_scan1 <- setdiff(radioclinical_df$patient_id, acq_params_df$patient_id[acq_params_df$scan=="SCAN1"])
+    patients_without_scan2 <- setdiff(radioclinical_df$patient_id, acq_params_df$patient_id[acq_params_df$scan=="SCAN2"])
+    radioclinical_df$patients_without_scan1 <- radioclinical_df$patient_id %in%patients_without_scan1
+    radioclinical_df$patients_without_scan1[radioclinical_df$patient_id=="#"] <- T
+    radioclinical_df$patients_without_scan2 <- radioclinical_df$patient_id %in%patients_without_scan2
+    radioclinical_df <- merge.data.frame(radioclinical_df, acq_params_df, by='patient_id', all.x = T, all.y = T)
+    
+    
+  }
+  
+  #import radiomic data
+  if(T){
+    
+    radiomic_df <- read.csv("#")[,-1]
+    radiomic_df$original_shape_VoxelVolume[radiomic_df$region_identified=="False"&
+                                             radiomic_df$scan=="SCAN2"] <- 0
+    scan1_df <- radiomic_df[radiomic_df$region=="gtv"&
+                              radiomic_df$scan=="SCAN1",]
+    scan2_df <- radiomic_df[radiomic_df$region=="gtv"&
+                              radiomic_df$scan=="SCAN2",]
+    scan2_df <- scan2_df[,c("patient_id", "original_shape_VoxelVolume", "original_shape_SurfaceVolumeRatio")]
+    colnames(scan2_df)[2:3] <- c("vol2", "svr2")
+    
+    delta_df <- merge.data.frame(scan1_df[,c("patient_id", "original_shape_VoxelVolume", "original_shape_SurfaceVolumeRatio")],
+                                 scan2_df[,c("patient_id", "vol2", "svr2")],
+                                 all.x=T,
+                                 all.y=T
+    )
+    colnames(delta_df)[2:3] <- c("vol1", "svr1")
+    delta_df$vol_delta <- (delta_df$vol2-delta_df$vol1)/delta_df$vol1
+    delta_df$svr_delta <- (delta_df$svr2-delta_df$svr1)/delta_df$svr1
+    
+    delta_df$RECI# <- NA
+    delta_df$RECI#[delta_df$vol_delta == -1] <- "CR"
+    delta_df$RECI#[(delta_df$vol_delta > -1)&
+                      (delta_df$vol_delta <= -0.3)
+    ] <- "PR"
+    delta_df$RECI#[(delta_df$vol_delta > -0.3)&
+                      (delta_df$vol_delta < 0.2)
+    ] <- "SD"
+    delta_df$RECI#[(delta_df$vol_delta >= 0.2)
+    ] <- "PD"
+    
+    
+    radiomic_df <- merge.data.frame(scan1_df, delta_df, all.x = T, all.y = T)
+    
+    radiomic_df$patients_with_corrupt_scan <- radiomic_df$patient_id %in% setdiff(acq_params_df$patient_id,
+                                                                                  radiomic_df$patient_id)
+    radiomic_df <- merge.data.frame(x=radiomic_df, y=acq_params_df, by=c("patient_id", "scan", "dataset"), all.x = T, all.y = T)
+    
+    radiomic_df$patients_without_visible_tumour <-  radiomic_df$region_identified=="False"
+    
+    radiomic_df$patients_with_truncation <- radiomic_df$truncation=="True"
+    radioclinical_df <- merge.data.frame(radioclinical_df, radiomic_df, all.x = T, all.y = T)
+    
+  }
+  
+}
+
+#data preparation 2
+if(T){
+  
+  #Clean clinical data
+  if(T){
+    
+    #read in clinical data
+    metadata_dir <- "#"
+    metadata_file <- file.path(metadata_dir,
+                               "query_standard_cohort_2023-12-02_14-50-22.tsv")
+    metadata <- read.delim(metadata_file, stringsAsFactors = F)
+    
+    #concatenate duplicates
+    metadata_list <- lapply(sort(unique(metadata$occams_id)), function(id_i){
+      
+      metadata_i <- metadata[which(metadata$occams_id==id_i),]
+      return(metadata_i[nrow(metadata_i),])
+    })
+    metadata <- do.call(rbind.data.frame, metadata_list)
+    
+    #identifiers
+    patient_id <- substr(metadata$occams_id, 8, nchar(metadata$occams_id))
+    patient_id <- gsub("/", "", patient_id)
+    sha_id <- metadata$sha_id
+    centre <- substr(patient_id, 1,2)
+    diagnosis_date <- as.Date(metadata$RD_DateOfOGCDiagnosis, format = "%d/%m/%Y")
+    
+    #overall survival
+    os_time <- as.matrix(metadata[,c("deceased_survival_days", "last_known_survival_days")])
+    os_time <- rowSums(os_time, na.rm = TRUE)
+    os_event <- !is.na(metadata$deceased_survival_days)
+    os_censor_date <- diagnosis_date+os_time
+    
+    #demographics
+    age <- metadata$DI_ageAtDiagnosis
+    female <- metadata$DI_PatientGender=="female"
+    smoking <- metadata$EX_IsSmoker
+    smoking[smoking==""]<- "unknown"
+    etoh <- metadata$EX_FormerlyOrCurrentlyHeavyDrinker
+    etoh[etoh==""] <- "unknown"
+    bmi <- metadata$EX_CurrentBMI
+    bmi[bmi==-1]<- NA
+    underweight <- (bmi < 18.5)|is.na(bmi)
+    
+    #clinical T stage
+    clin_t_stage <- metadata$PS_TStage_PrimaryTumour_FinalPretreatmentStaging
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_submucosa")] <- 1
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_muscularis_propria",
+                                     "T2")] <- 2
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_adventitia",
+                                     "T3")] <- 3
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_pleura_pericardium_or_diaphragm")] <- 4
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_adjacent_structures")] <- 4
+    clin_t_stage <- as.numeric(clin_t_stage)
+    clin_t_stage_b <- clin_t_stage >=3
+    
+    #clinical N stage
+    clin_n_stage <- metadata$PS_NStage_PrimaryTumour_FinalPretreatmentStaging_TNM7
+    clin_n_stage <- as.numeric(substr(clin_n_stage, 2, 2))
+    clin_n_stage_b <- clin_n_stage > 0
+    
+    #clinical M stage
+    clin_m_stage <- metadata$PS_MStage_PrimaryTumour_FinalPretreatmentStaging
+    clin_m_stage <- suppressWarnings(as.numeric(substr(clin_m_stage, 2,2)))
+    
+    #overall stage
+    overall_stage <- rep(NA, nrow(metadata))
+    overall_stage[clin_m_stage==1]<- "4b"
+    overall_stage[clin_n_stage==3 &is.na(overall_stage)] <- "4a"
+    overall_stage[clin_n_stage==2 &is.na(overall_stage)] <- "4a"
+    overall_stage[
+      metadata$PS_TStage_PrimaryTumour_FinalPretreatmentStaging==
+        "tumour_invades_adjacent_structures" &is.na(overall_stage)] <- "4a"
+    
+    overall_stage[clin_t_stage>=3&is.na(overall_stage)] <- "3"
+    overall_stage[clin_t_stage>=3&is.na(overall_stage)] <- "3"
+    overall_stage[clin_t_stage==2&
+                    clin_n_stage==1
+                  &is.na(overall_stage)] <- "3"
+    overall_stage[clin_t_stage==2
+                  &is.na(overall_stage)] <- "2b"
+    overall_stage[clin_t_stage==1&
+                    clin_n_stage==1&
+                    is.na(overall_stage)] <- "2a"
+    overall_stage[clin_t_stage==1&
+                    is.na(overall_stage)] <- "1"
+    overall_stage <- factor(overall_stage)
+    
+    
+    
+    #pathological T stage
+    path_t_stage <- metadata$RP_TStage_PrimaryTumour
+    path_t_stage_missing <- path_t_stage %in% c("not_recorded",
+                                                "")
+    path_t_stage[path_t_stage_missing] <- NA  # absent imputed as t4
+    path_t_stage[path_t_stage %in% c("no_evidence_of_primary_tumour",
+                                     "T0")] <- 0
+    path_t_stage[path_t_stage %in% c("tumour_invades_submucosa",
+                                     "tumour_invades_lamina_propria_or_muscularis_mucosae",
+                                     "tumour_invades_lamina_propria_muscularis_mucosae_or_submucosa",
+                                     "T1",
+                                     "T1a",
+                                     "T1b")] <- 1
+    path_t_stage[path_t_stage %in% c("tumour_invades_muscularis_propria",
+                                     "T2")] <- 2
+    path_t_stage[path_t_stage %in% c("tumour_invades_adventitia",
+                                     "T3")] <- 3
+    path_t_stage[path_t_stage %in% c("tumour_invades_pleura_pericardium_or_diaphragm",
+                                     "tumour_invades_adjacent_structures",
+                                     "tumour_invades_other_adjacent_structures_such_as_aorta_vertebral_body_or_trachea",
+                                     "T4a")] <- 4
+    path_t_stage <- as.numeric(path_t_stage)
+    
+    #path N stage
+    path_n_stage <- paste0(metadata$RP_Nstage_RP_TNM6,
+                           metadata$RP_Nstage_RP_TNM7)
+    path_n_stage_missing <- path_n_stage==""
+    path_n_stage[path_n_stage_missing] <- NA
+    path_n_stage <- as.numeric(substr(path_n_stage, 2, 2))
+    
+    #management
+    metadata$TP_PalliativeAntiCancerTreatmentModality[metadata$TP_PalliativeAntiCancerTreatmentModality=="unknown"] <- ""
+    treatment_modality <- paste0(
+      metadata$TP_CurativeTreatmentModality,
+      metadata$TP_PalliativeAntiCancerTreatmentModality
+    )
+    
+    # surgery
+    underwent_surgery <- metadata$#_MainSurgery=="yes"
+    
+    #chemotherapy
+    chemotherapy_protocol <- metadata$TR_ChemotherapyTreatmentProtocol
+    chemotherapy_protocol[chemotherapy_protocol%in%c("ECX",
+                                                     "ECX (Neo Aegis trial)",
+                                                     "ECX 12HR",
+                                                     "ECX 1HR",
+                                                     "ECX:12HR",
+                                                     "#O3/ECX only"
+    )] <- "epirubicin, cisplatin, capecitabine"
+    chemotherapy_protocol[chemotherapy_protocol%in%c("ECX +- Bevacuzimab",
+                                                     "ECX (Neo Aegis trial)",
+                                                     "ECX +-avastin",
+                                                     "ECX + avastin",
+                                                     "ECX+Bevacizumab (#O3)",
+                                                     "#03",
+                                                     "#O3(ECX or ECX&Bevacizumab)",
+                                                     "#O3/ECX only",
+                                                     "#03 trial",
+                                                     "#03")] <- "epirubicin, cisplatin, capecitabine +/- bevacizumab"
+    chemotherapy_protocol[chemotherapy_protocol%in%c("CROSS",
+                                                     "carboplatin +paclitaxel"
+    )] <- "carboplatin, paclitaxel"
+    chemotherapy_protocol[chemotherapy_protocol=="EOX"] <- "epirubicin, oxaliplatin, capecitabine"
+    chemotherapy_protocol[chemotherapy_protocol=="1xECX, 5x EOX"] <- "epirubicin, cisplatin, oxaliplatin, capecitabine"
+    chemotherapy_protocol[chemotherapy_protocol%in%c("ECarboX",
+                                                     " ECarboX",
+                                                     "E Carbo X")] <- "epirubicin, carboplatin, capecitabine"
+    chemotherapy_protocol[chemotherapy_protocol%in%c("CX")] <- "cisplatin, capecitabine"
+    chemotherapy_protocol[chemotherapy_protocol%in%c("ECF")] <- "epirubicin, cisplatin, 5-fluorouracil"
+    chemotherapy_protocol[chemotherapy_protocol%in%c("ECX after cycle 1 switched to ECF",
+                                                     "ECX (1x) ECF (2x)")] <- "epirubicin, cisplatin, capecitabine, 5-fluorouracil"
+    chemotherapy_protocol[chemotherapy_protocol%in%c("nil",
+                                                     "Nil",
+                                                     "Nil (no option to exclude)",
+                                                     "nill"
+    )] <- "unknown"
+    chemotherapy_protocol[chemotherapy_protocol%in%c("CarboX",
+                                                     "Carboplatin "
+    )] <- "carboplatin"
+    chemotherapy_protocol[chemotherapy_protocol %in% c("CIS/5-FU",
+                                                       "2Cisplatin/5FU",
+                                                       "CF",
+                                                       "Cis/5-FU",
+                                                       "Cisplatin + 5-FU",
+                                                       "Cisplatin/5'FU",
+                                                       "Cisplatin/5-FU",
+                                                       "Cisplatin/5FU",
+                                                       "C/5'FU ",
+                                                       "CIS/Capecitabine ",
+                                                       "Cisplatin/5 FU"
+    )] <- "cisplatin, 5-fluorouracil"
+    chemotherapy_protocol[chemotherapy_protocol %in% c("LEO",
+                                                       "LEO (XC&Lapatinib)",
+                                                       "Oxaliplatin, Capecitabine, Lapatinib(LEO)"
+                                                       
+    )] <- "lapatinib, capecitabine, oxaliplatin"
+    chemotherapy_protocol[chemotherapy_protocol %in% c("ECarboX")] <- "epirubicin, carboplatin, capecitabine"
+    chemotherapy_protocol[chemotherapy_protocol %in% c("Carboplatin")] <- "carboplatin"
+    chemotherapy_protocol[chemotherapy_protocol %in% c("Cisplatin/Capecitabine")] <- "cisplatin, capecitabine"
+    
+    chemotherapy_protocol[chemotherapy_protocol %in% c("O/5'FU")] <- "oxaliplatin, 5-fluorouracil"
+    chemotherapy_protocol[chemotherapy_protocol %in% c("Initially palliative - good response considered for curative surgery")] <- "other"
+    chemotherapy_protocol[chemotherapy_protocol %in% c("CX & Trastuzumab")] <- "cisplatin, capecitabine, trastuzumab"
+    chemotherapy_protocol[chemotherapy_protocol %in% c("")] <- "unknown"
+    chemotherapy_protocol2 <- chemotherapy_protocol
+    chemotherapy_protocol2[!chemotherapy_protocol2 %in% c("epirubicin, cisplatin, capecitabine",
+                                                          "cisplatin, 5-fluorouracil",
+                                                          "epirubicin, oxaliplatin, capecitabine",
+                                                          "none",
+                                                          "epirubicin, cisplatin, capecitabine +/- bevacizumab",
+                                                          "unknown"
+    )] <- "other"
+    chemotherapy_protocol <- chemotherapy_protocol2
+    
+    
+    #pathological T stage
+    path_t_stage <- metadata$RP_TStage_PrimaryTumour
+    path_t_stage_missing <- path_t_stage %in% c("not_recorded",
+                                                "")
+    path_t_stage[path_t_stage_missing] <- NA  # absent imputed as t4
+    path_t_stage[path_t_stage %in% c("no_evidence_of_primary_tumour",
+                                     "T0")] <- 0
+    path_t_stage[path_t_stage %in% c("tumour_invades_submucosa",
+                                     "tumour_invades_lamina_propria_or_muscularis_mucosae",
+                                     "tumour_invades_lamina_propria_muscularis_mucosae_or_submucosa",
+                                     "T1",
+                                     "T1a",
+                                     "T1b")] <- 1
+    path_t_stage[path_t_stage %in% c("tumour_invades_muscularis_propria",
+                                     "T2")] <- 2
+    path_t_stage[path_t_stage %in% c("tumour_invades_adventitia",
+                                     "T3")] <- 3
+    path_t_stage[path_t_stage %in% c("tumour_invades_pleura_pericardium_or_diaphragm",
+                                     "tumour_invades_adjacent_structures",
+                                     "tumour_invades_other_adjacent_structures_such_as_aorta_vertebral_body_or_trachea",
+                                     "T4a")] <- 4
+    path_t_stage <- as.numeric(path_t_stage)
+    path_t_stage_b <- path_t_stage >=3
+    
+    #path N stage
+    path_n_stage <- paste0(metadata$RP_Nstage_RP_TNM6,
+                           metadata$RP_Nstage_RP_TNM7)
+    path_n_stage_missing <- path_n_stage==""
+    path_n_stage[path_n_stage_missing] <- NA
+    path_n_stage <- as.numeric(substr(path_n_stage, 2, 2))
+    path_n_stage_b <- path_n_stage > 0
+    
+    #lymphvascular invasion
+    path_invasion <- metadata$RP_LymphoVascularInvasion
+    path_invasion_missing <- path_invasion==""
+    path_invasion[path_invasion_missing] <- NA
+    path_invasion <- (path_invasion=="yes")*1
+    
+    #pathological response
+    path_response <- (path_t_stage < clin_t_stage)*1
+    path_response_missing <- is.na(path_response)
+    
+    #lymphvascular invasion
+    path_invasion <- metadata$RP_LymphoVascularInvasion
+    path_invasion_missing <- path_invasion==""
+    path_invasion[path_invasion_missing] <- NA
+    path_invasion <- (path_invasion=="yes")*1
+    
+    #pathological response
+    path_response <- (path_t_stage < clin_t_stage)*1
+    path_response_missing <- is.na(path_response)
+    
+    #mandard
+    mandard_response <- as.numeric(substr(metadata$RP_MandardScoreForResponse, 4,4))
+    
+    #tumour location
+    tumour_location <- metadata$RD_OesophagusSite
+    tumour_location[tumour_location=="lower third"]<- "Oesophagus Lower"
+    tumour_location[tumour_location=="middle third"]<- "Oesophagus Middle"
+    tumour_location[tumour_location=="upper third"]<- "Oesophagus Upper"
+    siewert <-  metadata$RD_SiewertClassification
+    siewert[siewert=="unknown"] <- ""
+    siewert <- paste0("Siewert ", siewert)
+    tumour_location[tumour_location==""]<- siewert[tumour_location==""]
+    tumour_location[tumour_location=="Siewert "]<- "Unknown"
+    combined_tumour_site <- metadata$RD_CombinedTumourSite
+    combined_tumour_site[combined_tumour_site=="GOJ_Siewert:unknown"] <- ""
+    combined_tumour_site[combined_tumour_site==""]<- metadata$RP_PostOpPathCombinedTumourSite[combined_tumour_site==""]
+    combined_tumour_site <- gsub("GOJ_", "", combined_tumour_site)
+    combined_tumour_site <- gsub(":", " ", combined_tumour_site)
+    combined_tumour_site[combined_tumour_site=="Oesophagus lower third"] <- "Oesophagus Lower"
+    combined_tumour_site[combined_tumour_site=="Oesophagus middle third"] <- "Oesophagus Middle"
+    combined_tumour_site[combined_tumour_site=="Oesophagus upper third"] <- "Oesophagus Upper"
+    combined_tumour_site[combined_tumour_site=="Siewert unknown"] <- "Unknown"
+    tumour_location[combined_tumour_site!=""] <- combined_tumour_site[combined_tumour_site!=""]
+    metadata$RD_Stomach[metadata$RD_Stomach==""] <- "Unknown"
+    metadata$RD_Stomach[metadata$RD_Stomach=="cardia"] <- "Siewert 2"
+    metadata$RD_Stomach[metadata$RD_Stomach=="fundus"] <- "Siewert 3"
+    metadata$RD_Stomach[metadata$RD_Stomach=="antrum"] <- "Siewert 3"
+    tumour_location[tumour_location=="Unknown"] <-
+      metadata$RD_Stomach[tumour_location=="Unknown"]
+    ps_siewert <- metadata$PS_SiewertClassification
+    ps_siewert[ps_siewert%in%c("", "unknown")]<- "Unknown"
+    ps_siewert[ps_siewert!="Unknown"] <-
+      paste0("Siewert ",
+             ps_siewert[ps_siewert!="Unknown"])
+    tumour_location[tumour_location=="Unknown"] <- ps_siewert[tumour_location=="Unknown"]
+    
+    clinical_data <- data.frame(
+      pathology="oesophageal adenocarcinoma",
+      patient_id,
+      sha_id,
+      centre,
+      diagnosis_date,
+      age,
+      female,
+      bmi,
+      underweight,
+      smoking,
+      etoh,
+      underwent_surgery,
+      clin_t_stage,
+      clin_t_stage_b,
+      clin_n_stage,
+      clin_n_stage_b,
+      clin_m_stage,
+      overall_stage,
+      path_t_stage,
+      path_t_stage_b,
+      path_n_stage,
+      path_n_stage_b,
+      path_response,
+      os_time,
+      os_event,
+      treatment_modality,
+      chemotherapy_protocol,
+      mandard_response,
+      path_response,
+      tumour_location,
+      stringsAsFactors = F
+    )
+    rownames(clinical_data) <- clinical_data$patient_id
+    
+    initial_patient_count <- length(unique(patient_id))
+    initial_centre_counts <- table(centre)
+    
+    radioclinical_df <- clinical_data
+    radioclinical_df$nonchemorad_patients <- clinical_data$treatment_modality %in% c("surgery only",
+                                                                                     "palliative oncological treatment")
+    
+    
+  }
+  
+  #import ct image acquisition parameters
+  if(T){
+    acq_params_file <- '#'
+    acq_params_df <- read.csv(acq_params_file)[,-1]
+    acq_params_df <- acq_params_df[,!colnames(acq_params_df)=="slice_thickness"]
+    acq_params_df$acq_study_date <- paste0(
+      substr(acq_params_df$acq_study_date,
+             1,4),'-',
+      substr(acq_params_df$acq_study_date,
+             5,6),'-',
+      substr(acq_params_df$acq_study_date,
+             7,8)
+    )
+    acq_params_df$acq_study_date <- as.Date(acq_params_df$acq_study_date, format="%Y-%m-%d")
+    truncation_df <- read.csv('#')[,-1]
+    acq_params_df <- merge.data.frame(acq_params_df, truncation_df, all.x = F, all.y = T)
+    acq_params_df$truncation[is.na(acq_params_df$truncation)] <- F
+    acq_params_df$dataset <- "ALIAS"
+    
+    patients_without_scan1 <- setdiff(radioclinical_df$patient_id, acq_params_df$patient_id[acq_params_df$scan=="SCAN1"])
+    patients_without_scan2 <- setdiff(radioclinical_df$patient_id, acq_params_df$patient_id[acq_params_df$scan=="SCAN2"])
+    radioclinical_df$patients_without_scan1 <- radioclinical_df$patient_id %in%patients_without_scan1
+    radioclinical_df$patients_without_scan1[radioclinical_df$patient_id=="#"] <- T
+    radioclinical_df$patients_without_scan2 <- radioclinical_df$patient_id %in%patients_without_scan2
+    radioclinical_df <- merge.data.frame(radioclinical_df, acq_params_df, by='patient_id', all.x = T, all.y = T)
+    
+    
+  }
+  
+  #import radiomic data
+  if(T){
+    
+    radiomic_df <- read.csv("#")[,-1]
+    radiomic_df$original_shape_VoxelVolume[radiomic_df$region_identified=="False"&
+                                             radiomic_df$scan=="SCAN2"] <- 0
+    scan1_df <- radiomic_df[radiomic_df$region=="gtv"&
+                              radiomic_df$scan=="SCAN1",]
+    scan2_df <- radiomic_df[radiomic_df$region=="gtv"&
+                              radiomic_df$scan=="SCAN2",]
+    scan2_df <- scan2_df[,c("patient_id", "original_shape_VoxelVolume", "original_shape_SurfaceVolumeRatio")]
+    colnames(scan2_df)[2:3] <- c("vol2", "svr2")
+    
+    delta_df <- merge.data.frame(scan1_df[,c("patient_id", "original_shape_VoxelVolume", "original_shape_SurfaceVolumeRatio")],
+                                 scan2_df[,c("patient_id", "vol2", "svr2")],
+                                 all.x=T,
+                                 all.y=T
+    )
+    colnames(delta_df)[2:3] <- c("vol1", "svr1")
+    delta_df$vol_delta <- (delta_df$vol2-delta_df$vol1)/delta_df$vol1
+    delta_df$svr_delta <- (delta_df$svr2-delta_df$svr1)/delta_df$svr1
+    
+    delta_df$RECI# <- NA
+    delta_df$RECI#[delta_df$vol_delta == -1] <- "CR"
+    delta_df$RECI#[(delta_df$vol_delta > -1)&
+                      (delta_df$vol_delta <= -0.3)
+    ] <- "PR"
+    delta_df$RECI#[(delta_df$vol_delta > -0.3)&
+                      (delta_df$vol_delta < 0.2)
+    ] <- "SD"
+    delta_df$RECI#[(delta_df$vol_delta >= 0.2)
+    ] <- "PD"
+    
+    
+    radiomic_df <- merge.data.frame(scan1_df, delta_df, all.x = T, all.y = T)
+    
+    radiomic_df$patients_with_corrupt_scan <- radiomic_df$patient_id %in% setdiff(acq_params_df$patient_id,
+                                                                                  radiomic_df$patient_id)
+    radiomic_df <- merge.data.frame(x=radiomic_df, y=acq_params_df, by=c("patient_id", "scan", "dataset"), all.x = T, all.y = T)
+    
+    radiomic_df$patients_without_visible_tumour <-  radiomic_df$region_identified=="False"
+    
+    radiomic_df$patients_with_truncation <- radiomic_df$truncation=="True"
+    radioclinical_df <- merge.data.frame(radioclinical_df, radiomic_df, all.x = T, all.y = T)
+    
+  }
+  
+}
+
+#exclusions
+if(T){
+  
+  exclusion_cols <- grep("patients", colnames(radioclinical_df), value=T)
+  exclusion_df <- radioclinical_df[,c("patient_id", exclusion_cols)]
+  exclusion_df[is.na(exclusion_df)] <- F
+  exclusion_counts <- c()
+  all_excluded_patients <- c()
+  for(exclusion_i in exclusion_cols){
+    excluded_patients <- unique(exclusion_df$patient_id[exclusion_df[,exclusion_i]])
+    all_excluded_patients <- c(all_excluded_patients, excluded_patients)
+    exclusion_counts <- c(exclusion_counts, length(excluded_patients))
+    exclusion_df <- exclusion_df[!exclusion_df$patient_id %in% excluded_patients,]
+    
+  }
+  names(exclusion_counts) <- exclusion_cols
+  included_patients <- unique(exclusion_df$patient_id)
+  radioclinical_df <- radioclinical_df[
+    radioclinical_df$patient_id %in% included_patients,
+  ]
+  radioclinical_df <- radioclinical_df[radioclinical_df$scan=="SCAN1",]
+  radioclinical_df <- radioclinical_df[!is.na(radioclinical_df$scan),]
+}
+
+#merge datasets
+if(T){
+  all_data <- radioclinical_df
+  train_centres <- c("#", "#")
+}
+
+#partition data
+if(T){
+  
+  all_data <- radioclinical_df
+  all_data$original_shape_VoxelVolume <- log(all_data$original_shape_VoxelVolume/1000)
+  all_data$original_shape_SurfaceVolumeRatio <- log(all_data$original_shape_SurfaceVolumeRatio)
+  train_centres <- c("#", "#")   
+  train_idx <- all_data$centre %in% train_centres
+  test_idx <- !train_idx
+  df_list <- list()
+  
+  df_list$Train <- all_data[train_idx, ]
+  df_list$Test <- all_data[test_idx, ]
+  
+  
+}
+
+#modelling volume
+if(T){
+  
+  measure_performance <- function(y, yhat, mod_name, dataset, n_bs=500){
+    
+    n <- length(y)
+    res <- sapply(1:n_bs, function(bs_i){
+      
+      bs_idx <- sample(n, replace=T)
+      y_bs <- y[bs_idx]
+      yhat_bs <- yhat[bs_idx]
+      
+      Rho <- cor(y_bs, yhat_bs, method = "spearman")
+      MSE <- mean((y_bs-yhat_bs)^2)
+      return(c(Rho, MSE))
+      
+    })
+    res <- t(apply(res, 1, function(res_i){
+      c(mean(res_i), quantile(res_i, probs=c(0.025, 0.975)))
+    }))
+    res <- as.data.frame(res)
+    colnames(res) <- c("mean", "ci_lo", "ci_hi")
+    res <- cbind(metric=c("Rho", "MSE"),
+                 res)
+    
+    p_val <- cor.test(y, yhat, method="spearman")$p.value
+    
+    out <- list(
+      model=mod_name,
+      dataset=dataset,
+      res=res,
+      p_val=p_val,
+      y=y,
+      yhat=yhat
+    )
+    return(out)
+  }
+  
+  #clinical model
+  feature_list <- c("age","female","clin_t_stage")#,"original_shape_VoxelVolume" 
+  df_train <- df_list$Train[,c("vol_delta", feature_list)]
+  df_test <- df_list$Test[,c("vol_delta", feature_list)]
+  
+  clin_mod <- lm(
+    formula=vol_delta~.,
+    data=df_train
+  )
+  y_train <-  df_train$vol_delta
+  y_test <- df_test$vol_delta
+  yhat_train <- predict(clin_mod)
+  yhat_test <- predict(clin_mod, df_test)
+  
+  clin_performance_train <- measure_performance(y_train,
+                                                yhat_train,
+                                                "Clinical",
+                                                "Train"
+  )
+  clin_performance_test <- measure_performance(y_test,
+                                               yhat_test,
+                                               "Clinical",
+                                               "Test"
+  )
+  
+  #clinrad model
+  clinrad_feature_list <- c("original_shape_VoxelVolume", "original_shape_SurfaceVolumeRatio")
+  df_train <- df_list$Train[,c("vol_delta", clinrad_feature_list)]
+  df_test <- df_list$Test[,c("vol_delta", clinrad_feature_list)]
+  
+  clinrad_mod <- lm(
+    formula=vol_delta~.,
+    data=df_train
+  )
+  y_train <-  df_list$Train$vol_delta
+  y_test <- df_list$Test$vol_delta
+  yhat_train <- predict(clinrad_mod)
+  yhat_test <- predict(clinrad_mod, df_test)
+  
+  clinrad_performance_train <- measure_performance(y_train,
+                                                   yhat_train,
+                                                   "ClinRad",
+                                                   "Train"
+  )
+  clinrad_performance_test <- measure_performance(y_test,
+                                                  yhat_test,
+                                                  "ClinRad",
+                                                  "Test"
+  )
+  
+  
+  #clinrad model
+  clinrad_feature_list <- c(clin_features, "original_shape_VoxelVolume", "original_shape_SurfaceVolumeRatio")
+  df_train <- df_list$Train[,c("vol_delta", clinrad_feature_list)]
+  df_test <- df_list$Test[,c("vol_delta", clinrad_feature_list)]
+  
+  clinrad_mod <- lm(
+    formula=vol_delta~.,
+    data=df_train
+  )
+  y_train <-  df_list$Train$vol_delta
+  y_test <- df_list$Test$vol_delta
+  yhat_train <- predict(clinrad_mod)
+  yhat_test <- predict(clinrad_mod, df_test)
+  
+  clinrad_performance_train <- measure_performance(y_train,
+                                                   yhat_train,
+                                                   "ClinRad",
+                                                   "Train"
+  )
+  clinrad_performance_test <- measure_performance(y_test,
+                                                  yhat_test,
+                                                  "ClinRad",
+                                                  "Test"
+  )
+  
+  #model coefficients
+  clin_coefs <- as.data.frame(summary(clin_mod)$coefficients)[,c(1,2,3)]
+  clin_coefs$model <- "Clinical"
+  clin_coefs$variable <- rownames(clin_coefs)
+  rownames(clin_coefs) <- NULL
+  clinvol_coefs <- as.data.frame(summary(clinvol_mod)$coefficients)[,c(1,2,3)]
+  clinvol_coefs$model <- "ClinVol"
+  clinvol_coefs$variable <- rownames(clinvol_coefs)
+  rownames(clinvol_coefs) <- NULL
+  
+  coefs_df <- rbind(clin_coefs, clinvol_coefs)
+  colnames(coefs_df) <- c("beta", "sigma", "t_score", "model", "variable")
+  coefs_df <- coefs_df[,c("model", "variable", "beta", "sigma", "t_score")]
+  coefs_df$variable <- gsub("^original_shape_VoxelVolume", "Volume", coefs_df$variable)
+  coefs_df$variable <- gsub("^original_firstorder_Maximum", "firstorder_Maximum", coefs_df$variable)
+  coefs_df$beta <- round(coefs_df$beta, 5)
+  coefs_df$sigma <- round(coefs_df$sigma, 3)
+  coefs_df$t_score <- round(coefs_df$t_score, 3)
+  coefs_df$outcome <- "Volume"
+  vol_coefs_df <- coefs_df
+  
+  all_res <- lapply(
+    list(clin_performance_train,
+         clin_performance_test,
+         clinrad_performance_train,
+         clinrad_performance_test),
+    function(performance_i){
+      
+      df_i <- performance_i$res
+      df_i$model <- performance_i$model
+      df_i$dataset <- performance_i$dataset
+      return(df_i)
+      
+    })
+  all_res <- do.call(rbind.data.frame, all_res)
+  all_res <- all_res[,c(5:6, 1:4)]
+  all_res[,4:6]<- round(all_res[,4:6], 2)
+  all_res[,4:6] <- lapply(all_res[,4:6], function(i) format(i, nsmall=2))
+  all_res$res <- paste0(all_res$mean,
+                        " [",
+                        all_res$ci_lo,
+                        ",",
+                        all_res$ci_hi,
+                        "]"
+  )
+  all_res <- all_res[,!colnames(all_res)%in%c("mean", "ci_lo", "ci_hi")]
+  all_res <- all_res[order(all_res$metric),]
+  all_res <- cbind(all_res[all_res$metric=="MSE",],
+                   all_res$res[all_res$metric=="Rho"]
+  )
+  all_res <- all_res[,colnames(all_res)!="metric"]
+  colnames(all_res)<- c("Model", "Dataset", "MSE", "Rho")
+  all_res$p <- unlist(sapply(list(clin_performance_train,
+                                  clin_performance_test,
+                                  clinrad_performance_train,
+                                  clinrad_performance_test), "[", "p_val"))
+  all_res$p <- round(all_res$p, 5)
+  all_res$outcome <- "Volume delta"
+  all_res_vol <- all_res
+  
+  
+  #check null calibration
+  test_null_measures_1 <- sapply(1:500, function(bs_i){
+    
+    y_test_null <- sample(y_train, size=length(y_test), replace=T)
+    MSE <- mean((y_test - y_test_null)^2)
+    
+    out_i <- c( MSE=MSE)
+    return(out_i)
+  })
+  test_null_measures_1 <- c(mean(test_null_measures_1),
+                            quantile(test_null_measures_1, c(0.025, 0.975)))
+  
+  test_null_measures_2 <- sapply(1:500, function(bs_i){
+    
+    y_test_null <- rep(mean(y_train), length(y_test))
+    y_test <- sample(y_test, replace=T)
+    MSE <- mean((y_test - y_test_null)^2)
+    
+    out_i <- c(MSE=MSE)
+    return(out_i)
+  })
+  test_null_measures_2 <- c(mean(test_null_measures_2),
+                            quantile(test_null_measures_2, c(0.025, 0.975)))
+  
+}
+
+#modelling svr
+if(T){
+  
+  #clinical model
+  feature_list <- c("age","female", "clin_t_stage")#,, "original_shape_VoxelVolume"
+  df_train <- df_list$Train[,c("svr_delta", feature_list)]
+  df_test <- df_list$Test[,c("svr_delta", feature_list)]
+  
+  clin_mod <- lm(
+    formula=svr_delta~.,
+    data=df_train
+  )
+  y_train <-  df_train$svr_delta
+  y_test <- df_test$svr_delta
+  yhat_train <- predict(clin_mod)
+  yhat_test <- predict(clin_mod, df_test)
+  
+  clin_performance_train <- measure_performance(y_train,
+                                                yhat_train,
+                                                "Clinical",
+                                                "Train"
+  )
+  clin_performance_test <- measure_performance(y_test,
+                                               yhat_test,
+                                               "Clinical",
+                                               "Test"
+  )
+  
+  #clinrad model
+  clinrad_feature_list <- c(feature_list, "original_shape_VoxelVolume", "original_shape_SurfaceVolumeRatio")
+  df_train <- df_list$Train[,c("svr_delta",clinrad_feature_list)]
+  df_test <- df_list$Test[,c("svr_delta",clinrad_feature_list)]
+  
+  clinrad_mod <- lm(
+    formula=svr_delta~.,
+    data=df_train
+  )
+  y_train <-  df_list$Train$svr_delta
+  y_test <- df_list$Test$svr_delta
+  yhat_train <- predict(clinrad_mod)
+  yhat_test <- predict(clinrad_mod, df_test)
+  
+  clinrad_performance_train <- measure_performance(y_train,
+                                                   yhat_train,
+                                                   "ClinRad",
+                                                   "Train"
+  )
+  clinrad_performance_test <- measure_performance(y_test,
+                                                  yhat_test,
+                                                  "ClinRad",
+                                                  "Test"
+  )
+  
+  
+  
+  #model coefficients
+  clin_coefs <- as.data.frame(summary(clin_mod)$coefficients)[,c(1,2,3)]
+  clin_coefs$model <- "Clinical"
+  clin_coefs$variable <- rownames(clin_coefs)
+  rownames(clin_coefs) <- NULL
+  clinvol_coefs <- as.data.frame(summary(clinvol_mod)$coefficients)[,c(1,2,3)]
+  clinvol_coefs$model <- "ClinVol"
+  clinvol_coefs$variable <- rownames(clinvol_coefs)
+  rownames(clinvol_coefs) <- NULL
+  
+  coefs_df <- rbind(clin_coefs, clinvol_coefs)
+  colnames(coefs_df) <- c("beta", "sigma", "t_score", "model", "variable")
+  coefs_df <- coefs_df[,c("model", "variable", "beta", "sigma", "t_score")]
+  coefs_df$variable <- gsub("^original_shape_VoxelVolume", "Volume", coefs_df$variable)
+  coefs_df$variable <- gsub("^original_firstorder_Maximum", "firstorder_Maximum", coefs_df$variable)
+  coefs_df$beta <- round(coefs_df$beta, 5)
+  coefs_df$sigma <- round(coefs_df$sigma, 3)
+  coefs_df$t_score <- round(coefs_df$t_score, 3)
+  coefs_df$outcome <- "SVR"
+  svr_coefs_df <- coefs_df
+  
+  #aggregate coefs_dfs
+  coefs_df <- rbind(vol_coefs_df, svr_coefs_df)
+  write.csv(coefs_df, file='tables/coefs_df.csv')
+  
+  all_res <- lapply(
+    list(clin_performance_train,
+         clin_performance_test,
+         clinrad_performance_train,
+         clinrad_performance_test),
+    function(performance_i){
+      
+      df_i <- performance_i$res
+      df_i$model <- performance_i$model
+      df_i$dataset <- performance_i$dataset
+      return(df_i)
+      
+    })
+  all_res <- do.call(rbind.data.frame, all_res)
+  all_res <- all_res[,c(5:6, 1:4)]
+  all_res[,4:6]<- round(all_res[,4:6], 2)
+  all_res[,4:6] <- lapply(all_res[,4:6], function(i) format(i, nsmall=2))
+  all_res$res <- paste0(all_res$mean,
+                        " [",
+                        all_res$ci_lo,
+                        ",",
+                        all_res$ci_hi,
+                        "]"
+  )
+  all_res <- all_res[,!colnames(all_res)%in%c("mean", "ci_lo", "ci_hi")]
+  all_res <- all_res[order(all_res$metric),]
+  all_res <- cbind(all_res[all_res$metric=="MSE",],
+                   all_res$res[all_res$metric=="Rho"]
+  )
+  all_res <- all_res[,colnames(all_res)!="metric"]
+  colnames(all_res)<- c("Model", "Dataset", "MSE", "Rho")
+  all_res$p <- unlist(sapply(list(clin_performance_train,
+                                  clin_performance_test,
+                                  clinrad_performance_train,
+                                  clinrad_performance_test), "[", "p_val"))
+  all_res$p <- round(all_res$p, 5)
+  all_res$outcome <- "SVR delta"
+  all_res_svr <- all_res
+  all_res <- rbind(all_res_vol, all_res_svr)
+  all_res <- all_res[order(all_res$Dataset),]
+  all_res$Model[all_res$Model=="ClinRad"]<- "ClinVol"
+  all_res <- cbind(all_res$outcome, all_res[,1:5])
+  write.csv(all_res,
+            file="tables/all_res_both.csv")
+  
+  
+  
+  
+  
+  #check null calibration
+  test_null_measures_1 <- sapply(1:500, function(bs_i){
+    
+    y_test_null <- sample(y_train, size=length(y_test), replace=T)
+    MSE <- mean((y_test - y_test_null)^2)
+    
+    out_i <- c( MSE=MSE)
+    return(out_i)
+  })
+  test_null_measures_1 <- c(mean(test_null_measures_1),
+                            quantile(test_null_measures_1, c(0.025, 0.975)))
+  
+  test_null_measures_2 <- sapply(1:500, function(bs_i){
+    
+    y_test_null <- rep(mean(y_train), length(y_test))
+    y_test <- sample(y_test, replace=T)
+    MSE <- mean((y_test - y_test_null)^2)
+    
+    out_i <- c(MSE=MSE)
+    return(out_i)
+  })
+  test_null_measures_2 <- c(mean(test_null_measures_2),
+                            quantile(test_null_measures_2, c(0.025, 0.975)))
+  
+}
+
+#data characteristics
+if(F){
+  
+  #clinical characteristics
+  all_data$Pathology_fac <- fac2(all_data$pathology)
+  all_data$Institution_fac <- fac2(all_data$centre, levels=c("#", "#", "#", "#", "#"))
+  all_data$Age_fac <- cut(all_data$age, c(30, 45, 60, 75, 90))
+  all_data$Sex_fac <- factor(ifelse(all_data$female, "female", "male"))
+  all_data$BMI_fac <- as.character(cut(all_data$bmi, c(0, 20, 30, 40, 50)))
+  all_data$BMI_fac[is.na(all_data$BMI_fac)] <- "unknown"
+  all_data$BMI_fac <- factor(all_data$BMI_fac)
+  all_data$EtOH_fac <- fac2(all_data$etoh)
+  all_data$Smoking_fac <- fac2(all_data$smoking)
+  all_data$Surgery_fac <- fac2(ifelse(all_data$underwent_surgery, "underwent_surgery", "did not undergo surgery"))
+  all_data$Chemotherapy_fac <- fac2(all_data$chemotherapy_protocol)
+  all_data$cT_stage_fac <- all_data$clin_t_stage
+  all_data$cT_stage_fac[is.na(all_data$cT_stage_fac)]<- "unknown"
+  all_data$cT_stage_fac <- fac2(all_data$cT_stage_fac)
+  all_data$cN_stage_fac <- all_data$clin_n_stage
+  all_data$cN_stage_fac[is.na(all_data$cN_stage_fac)]<- "unknown"
+  all_data$cN_stage_fac <- fac2(all_data$cN_stage_fac)
+  all_data$cM_stage_fac <- fac2(all_data$clin_m_stage)
+  all_data$tumour_location_fac <- fac2(all_data$tumour_location)
+  
+  all_data$Tumour_Volume_fac <- exp(all_data$original_shape_VoxelVolume)
+  all_data$Tumour_Volume_fac <- cut(all_data$Tumour_Volume_fac, breaks=c(0, 5, 25, 75, 125, 150))
+  all_data$RECI#_fac <- 
+    factor(
+      c("CR", "PR", "SD", "PD")[
+        cut(all_data$vol_delta, breaks=c(-2,-0.999, -0.3, 0.2, 2))
+      ],
+      levels=c("CR", "PR", "SD", "PD")
+    )
+  all_data$SVR_fac <- exp(all_data$original_shape_SurfaceVolumeRatio)
+  all_data$SVR_fac <- cut(all_data$SVR_fac, breaks=c(0, 0.25, 0.5, 0.75, 1))
+  
+  #image characteristics
+  all_data$acq_Scanner_Manufacturer_fac <- fac2(all_data$acq_scanner_manufacturer)
+  all_data$acq_kernel[all_data$kernel%in%c("2", "3", "b", "c")]<- "other"
+  all_data$acq_Kernel_fac <- fac2(all_data$acq_kernel)
+  all_data$acq_XR_Current_fac <- as.character(cut(as.numeric(all_data$acq_xr_current),
+                                                  breaks=c(0, 200, 500, 1000), dig.lab = 5))
+  all_data$acq_XR_Current_fac[is.na(all_data$acq_XR_Current_fac)] <- "unknown"
+  all_data$acq_XR_Current_fac <- fac2(all_data$acq_XR_Current_fac)
+  all_data$acq_kVp_fac <- fac2(as.numeric(all_data$acq_kvp))
+  all_data$acq_Exposure_Time_fac <- as.numeric(all_data$acq_exposure_time)
+  all_data$acq_Exposure_Time_fac <- as.character(cut(all_data$acq_Exposure_Time_fac,
+                                                     breaks=c(0, 400, 800, 1200), dig.lab = 5))
+  all_data$acq_Exposure_Time_fac[is.na(all_data$acq_Exposure_Time_fac)]<- "unknown"
+  all_data$acq_Exposure_Time_fac <- fac2(all_data$acq_Exposure_Time_fac)
+  all_data$acq_Exposure_fac <- as.character(cut(as.numeric(all_data$acq_exposure),
+                                                breaks=c(0, 100, 200, 300, Inf), dig.lab = 5))
+  all_data$acq_Exposure_fac[is.na(all_data$acq_Exposure_fac)] <- "unknown"
+  all_data$acq_Exposure_fac <- fac2(all_data$acq_Exposure_fac)
+  all_data$acq_Voxel_Width_fac <- as.character(cut(as.numeric(all_data$acq_voxel_dim),
+                                                   breaks=c(0.5, 0.7, 0.9, 1), dig.lab = 5))
+  all_data$acq_Voxel_Width_fac[is.na(all_data$acq_Voxel_Width_fac)] <- "unknown"
+  all_data$acq_Voxel_Width_fac <- factor(all_data$acq_Voxel_Width_fac)
+  
+  extract_summaries <- function(all_data, type="participant", train_centres=c("#", "#")){
+    
+    summary_vars <- grep("_fac$", colnames(all_data), value=T)
+    if(type=="acq"){
+      summary_vars <- summary_vars[grepl("^acq_", summary_vars)]
+    }else{
+      summary_vars <- summary_vars[!grepl("^acq_", summary_vars)]
+    }
+    
+    
+    summaries_list <- lapply(list(
+      
+      all=all_data[,summary_vars],
+      train=all_data[all_data$centre%in%train_centres,summary_vars],
+      test=all_data[!all_data$centre%in%train_centres,summary_vars]
+      
+    ), function(summary_df){
+      
+      all_summaries <- lapply(summary_df, function(summary_i){
+        summary_i <- as.matrix(as.data.frame(table(summary_i)))
+        colnames(summary_i)<- c("", "")
+        return(summary_i)
+      })
+      for(i in seq_along(all_summaries)){
+        m_i <- matrix("", nrow(all_summaries[[i]])+1,3)
+        m_i[1,]<- c(names(all_summaries)[[i]],
+                    "",
+                    "")
+        m_i[2:nrow(m_i), 2:3]<- as.matrix(all_summaries[[i]])
+        all_summaries[[i]] <- m_i
+      }
+      all_summaries <- do.call(rbind, all_summaries)
+      all_summaries[,1]<- gsub("_fac", "", all_summaries[,1])
+      all_summaries[,1]<- gsub("^acq ", "", all_summaries[,1])
+      all_summaries[,1]<- gsub("_", " ", all_summaries[,1])
+      return(all_summaries)
+      
+    })
+    summaries_rownames <- summaries_list$all[,1:2]
+    train_summaries <- summaries_list$train[,3, drop=F]
+    test_summaries <- summaries_list$test[,3, drop=F]
+    all_summaries <- do.call(cbind, list(summaries_rownames,
+                                         train_summaries,
+                                         test_summaries))
+    colnames(all_summaries) <- c("Variable", "Value", "N train", "N test")
+    return(all_summaries)
+  }
+  participant_summaries <- extract_summaries(all_data)
+  image_parameter_summaries <- extract_summaries(all_data, type="acq")
+  
+  
+  write.csv(participant_summaries,
+            "tables/participant_summaries.csv",
+            row.names = F)
+  write.csv(image_parameter_summaries,
+            "tables/image_parameter_summaries.csv",
+            row.names = F)
+}
+
+#data characteristics 2
+if(T){
+  
+  all_data <- all_data[all_data$patient_id %in% c(df_list$Train$patient_id, df_list$Test$patient_id),]
+  all_data$partition <- factor(ifelse(all_data$centre %in% train_centres, "Train", "Test"),
+                               levels=c("Train", "Test"))
+  
+  #clinical characteristics
+  #all_data$Age_fac <- cut(all_data$age, c(45, 60, 75, 90))
+  all_data$Sex_fac <- factor(ifelse(all_data$female, "female", "male"))
+  all_data$BMI_fac <- as.character(cut(all_data$bmi, c(0, 18.5, 25, 30, 45)))
+  all_data$BMI_fac[is.na(all_data$BMI_fac)] <- "unknown"
+  all_data$BMI_fac <- factor(all_data$BMI_fac)
+  all_data$Smoking_fac <- fac2(all_data$smoking)
+  all_data$Chemotherapy_fac <- fac2(all_data$chemotherapy_protocol)
+  all_data$cT_stage_fac <- all_data$clin_t_stage
+  all_data$cT_stage_fac[is.na(all_data$cT_stage_fac)]<- "unknown"
+  all_data$cT_stage_fac <- fac2(all_data$cT_stage_fac)
+  all_data$cN_stage_fac <- all_data$clin_n_stage
+  all_data$cN_stage_fac[is.na(all_data$cN_stage_fac)]<- "unknown"
+  all_data$cN_stage_fac <- fac2(all_data$cN_stage_fac)
+  all_data$Tumour_Location_fac <-  fac2(all_data$tumour_location,
+                                        levels = c("Oesophagus Middle", "Oesophagus Lower","Siewert 1",
+                                                   "Siewert 2", "Siewert 3"
+                                        ))
+  
+  all_data$Tumour_Volume_fac <- all_data$original_shape_VoxelVolume/1000
+  all_data$Tumour_Volume_fac <- cut(all_data$Tumour_Volume_fac, breaks=c(0, 5, 25, 75, 125, 150))
+  all_data$Treatment_Modality_fac <- factor(c(
+    "CRS", "CR", "S"
+  )[factor(all_data$treatment_modality)])
+  all_data$Tumour_Volume_fac <- exp(all_data$original_shape_VoxelVolume)
+  all_data$Tumour_Volume_fac <- cut(all_data$Tumour_Volume_fac, breaks=c(0, 5, 25, 75, 125, 150))
+  all_data$RECI#_fac <- 
+    factor(
+      c("CR", "PR", "SD", "PD")[
+        cut(all_data$vol_delta, breaks=c(-2,-0.999, -0.3, 0.2, 2))
+      ],
+      levels=c("CR", "PR", "SD", "PD")
+    )
+  all_data$SVR_fac <- exp(all_data$original_shape_SurfaceVolumeRatio)
+  all_data$SVR_fac <- cut(all_data$SVR_fac, breaks=c(0, 0.25, 0.5, 0.75, 1))
+  
+  #image characteristics
+  all_data$acq_Scanner_Manufacturer_fac <- fac2(all_data$acq_scanner_manufacturer)
+  all_data$acq_kernel[all_data$kernel%in%c("2", "3", "b", "c")]<- "other"
+  all_data$acq_kernel[!all_data$acq_kernel %in% names(sort(-table(all_data$acq_kernel)))[1:5]]<- "other"
+  all_data$acq_Kernel_fac <- fac2(all_data$acq_kernel)
+  all_data$acq_XR_Current_fac <- as.character(cut(as.numeric(all_data$acq_xr_current),
+                                                  breaks=c(0, 200, 500, 1000), dig.lab = 5))
+  all_data$acq_XR_Current_fac[is.na(all_data$acq_XR_Current_fac)] <- "unknown"
+  all_data$acq_XR_Current_fac <- fac2(all_data$acq_XR_Current_fac)
+  all_data$acq_kVp_fac <- fac2(as.numeric(all_data$acq_kvp))
+  all_data$acq_Exposure_Time_fac <- as.numeric(all_data$acq_exposure_time)
+  all_data$acq_Exposure_Time_fac <- as.character(cut(all_data$acq_Exposure_Time_fac,
+                                                     breaks=c(0, 400, 800, 1200), dig.lab = 5))
+  all_data$acq_Exposure_Time_fac[is.na(all_data$acq_Exposure_Time_fac)]<- "unknown"
+  all_data$acq_Exposure_Time_fac <- fac2(all_data$acq_Exposure_Time_fac)
+  all_data$acq_Exposure_fac <- as.character(cut(as.numeric(all_data$acq_exposure),
+                                                breaks=c(0, 100, 200, 300, Inf), dig.lab = 5))
+  all_data$acq_Exposure_fac[is.na(all_data$acq_Exposure_fac)] <- "unknown"
+  all_data$acq_Exposure_fac <- fac2(all_data$acq_Exposure_fac)
+  all_data$acq_Voxel_Width_fac <- as.character(cut(as.numeric(all_data$acq_voxel_dim),
+                                                   breaks=c(0.5, 0.7, 0.9, 1), dig.lab = 5))
+  all_data$acq_Voxel_Width_fac[is.na(all_data$acq_Voxel_Width_fac)] <- "unknown"
+  all_data$acq_Voxel_Width_fac <- factor(all_data$acq_Voxel_Width_fac)
+  
+  extract_summaries <- function(all_data, table_type="participant"){
+    
+    summary_vars <- grep("_fac$", colnames(all_data), value=T)
+    if(table_type=="acq"){
+      summary_vars <- summary_vars[grepl("^acq_", summary_vars)]
+    }else{
+      all_data <- all_data[!duplicated(all_data$patient_id),]
+      summary_vars <- summary_vars[!grepl("^acq_", summary_vars)]
+    }
+    summary_list <- lapply(summary_vars, function(summary_var_i){
+      
+      tbl_i <- table(as.data.frame(all_data[,c( summary_var_i, "partition")]))
+      if("unavailable" %in% rownames(tbl_i)){
+        tbl_i <- tbl_i[c(which(rownames(tbl_i)!="unavailable"),
+                         which(rownames(tbl_i)=="unavailable")),]
+      }
+      test_i <- fisher.test(tbl_i)
+      tbl_i[] <- paste0(tbl_i, " (", 100*round(t(t(tbl_i)/colSums(tbl_i)), 2), ")")
+      tbl_i <- cbind(rownames(tbl_i), tbl_i)
+      mat_i <- matrix("", nrow(tbl_i)+1, 5)
+      mat_i[-1,2:4]<- tbl_i
+      mat_i[1]<- gsub("_fac", "", summary_var_i)
+      mat_i[nrow(mat_i),5]<- round(test_i$p.value, 5)
+      return(mat_i)
+    })
+    summary_list <- do.call(rbind, summary_list)
+    colnames(summary_list)<- c("Variable", "Value", "Train", "Validation", "P-value")
+    return(summary_list)
+    
+  }
+  participant_summaries <- extract_summaries(all_data)
+  age_train_mean <- round(mean(all_data$age[all_data$partition=="Train"]))
+  age_train_sd <- round(sd(all_data$age[all_data$partition=="Train"]))
+  age_test_mean <- round(mean(all_data$age[all_data$partition=="Test"]))
+  age_test_sd <- round(sd(all_data$age[all_data$partition=="Test"]))
+  age_pval <- round(t.test(all_data$age[all_data$partition=="Train"], all_data$age[all_data$partition=="Test"])$p.value, 2)
+  
+  age_summary <- c("Age", "Years",
+                   paste0(age_train_mean, "+/-", age_train_sd),
+                   paste0(age_test_mean, "+/-", age_test_sd),
+                   age_pval)
+  names(age_summary) <- colnames(participant_summaries)
+  participant_summaries <- rbind(age_summary, participant_summaries)
+  
+  write.csv(participant_summaries,
+            "tables/participant_summaries.csv",
+            row.names = F)
+  
+  image_parameter_summaries <- extract_summaries(all_data, table_type="acq")
+  write.csv(image_parameter_summaries,
+            "tables/image_parameter_summaries.csv",
+            row.names = F)
+  
+  
+  
+  
+}
+
+#plotting
+if(T){
+  
+  library(ggpubr)
+  
+  #data characteristics
+  characteristics_plot_df <- all_data[,c("centre", "Age_fac", "cT_stage_fac", 
+                                         "Treatment_Modality_fac", "Tumour_Volume_fac","RECI#_fac",
+                                         "acq_Scanner_Manufacturer_fac"
+  )]
+  characteristics_plot_df$Dataset <- ""
+  characteristics_plot_df$Dataset[all_data$centre%in%c("#", "#")]<- "Train"
+  characteristics_plot_df$Dataset[characteristics_plot_df$Dataset==""]<- "Test"
+  characteristics_plot_df$Dataset <- factor(characteristics_plot_df$Dataset, levels=c("Train", "Test"))
+  
+  characteristics_plot_df <- characteristics_plot_df[,-1]
+  
+  colnames(characteristics_plot_df)[1:6] <- c("Age", "cT_Stage", 
+                                              "Treatment_Pathway",
+                                              "Tumour_Volume",
+                                              "RECI#",
+                                              "Scanner")
+  characteristics_plot_df$Scanner <- c("GE", "Philips", "Siemens", "Toshiba")[characteristics_plot_df$Scanner]
+  characteristics_plot_df$cT_Stage <- factor(paste0("T", as.character(characteristics_plot_df$cT_Stage)))
+  xlab_list <- list(
+    Age="Years",
+    cT_Stage=element_blank(),
+    Treatment_Pathway=element_blank(),
+    Tumour_Volume="ml",
+    RECI#=element_blank(),
+    Scanner=element_blank()
+  )
+  characteristics_plot_list <- lapply(1:6, function(plot_i){
+    var_i <- colnames(characteristics_plot_df)[plot_i]
+    tbl_i <- table(characteristics_plot_df[,c("Dataset", var_i)])
+    tbl_i <- tbl_i
+    tbl_i <- melt(tbl_i)
+    colnames(tbl_i)[2]<- var_i
+    title_i <- gsub("_", " ", var_i)
+    title_i <- gsub("T Stage", "T-Stage",title_i)
+    xlab_i <- xlab_list[[var_i]]
+    tbl_plot_i <- ggplot(tbl_i, aes_string(fill="Dataset", x=var_i, y="value"))+
+      geom_bar(stat = "identity", width=0.5,position=position_dodge(width = 0.6))+
+      coord_flip()+
+      ggtitle(title_i)+
+      ylab("N")+
+      theme(axis.title.y=element_text(size=rel(0.8)))+
+      xlab(xlab_i)
+    
+    return(tbl_plot_i)
+  })
+  characteristics_plots <- ggarrange(plotlist = characteristics_plot_list,
+                                     common.legend = T,
+                                     nrow = 2,
+                                     ncol= 3,
+                                     legend="bottom")
+  ggsave(characteristics_plots,
+         filename = "figures/characteristics_plots.png",
+         width=10,
+         height=6,
+         dpi=600,
+         units = "in")
+  
+  
+  #Scatter Plots
+  scatter_df <- lapply(list(
+    clin_performance_train,
+    clin_performance_test,
+    clinrad_performance_train,
+    clinrad_performance_test
+  ), function(list_i){
+    data.frame(
+      model=list_i$model,
+      dataset=list_i$dataset,
+      y=list_i$y,
+      yhat=list_i$yhat
+    )
+  })
+  scatter_df <- do.call(rbind, scatter_df)
+  scatter_df$dataset <- factor(scatter_df$dataset,
+                               levels=c("Train", "Test")
+  )
+  colnames(scatter_df)[1] <- "Model"
+  scatter_df$log_volume <- rep(c(df_train$original_shape_VoxelVolume,
+                                 df_test$original_shape_VoxelVolume
+  ), 2)
+  
+  
+  scatter_plots <- ggplot(scatter_df, aes(x=y, y=yhat, colour=Model))+ 
+    geom_point()+
+    xlab("Volume Delta")+
+    ylab("Predicted Volume Delta")+
+    geom_hline(yintercept=0, linetype=2)+
+    geom_vline(xintercept=0, linetype=2)+
+    facet_grid(dataset~Model)+
+    scale_colour_manual(
+      values=c("Clinical"="violetred",
+               "ClinRad"="forestgreen"
+      )
+    )+scale_y_continuous(labels = scales::percent)
+  
+  
+  ggsave(scatter_plots,
+         filename = "figures/scatter_plots.png",
+         width=8,
+         height=7,
+         dpi=600,
+         units = "in")
+  
+  scatter_df2 <- rbind(df_list$Train, df_list$Test)
+  scatter_df2$cohort <- ifelse(scatter_df2$centre %in% train_centres, "Train", "Test")
+  scatter_df2$pre_vol <- scatter_df2$vol1/1000
+  p1 <- ggplot(scatter_df2, aes(x=pre_vol, y=vol_delta))+
+    geom_point(colour='hotpink')+
+    xlab(bquote('Pre-treatment volume '~(cm^3)))+
+    ylab("\U0394 Volume")+
+    geom_hline(yintercept=0, linetype=2)+
+    geom_vline(xintercept=0, linetype=2)+
+    scale_y_continuous(labels = scales::percent)
+  p2 <- ggplot(scatter_df2, aes(x=svr1, y=svr_delta))+
+    geom_point(colour='darkblue')+
+    xlab('Pre-treatment SVR')+
+    ylab("\U0394 SVR")+
+    geom_hline(yintercept=0, linetype=2)+
+    geom_vline(xintercept=0, linetype=2)+
+    scale_y_continuous(labels = scales::percent)
+  p12 <- ggarrange(plotlist=list(p1, p2))
+  ggsave(p12, filename = "figures/scatter_plots2.png",
+         width=8,
+         height=5,
+         dpi=600,
+         units = "in")
+  
+  
+  
+  
+  params_df <- expand.grid(rep=1:500,
+                           model=c("Clinical", "ClinRad")
+  )
+  coef_t_list <- lapply(1:nrow(params_df), function(i){
+    
+    bs_i <- sample(nrow(df_train), replace=T)
+    df_train_i <- df_list$Train[bs_i,]
+    
+    if(params_df$model[i]=="Clinical"){
+      df_train_i <- df_train_i[,c("vol_delta", names(coef(clin_mod))[-1])]
+    }else{
+      df_train_i <- df_train_i[,c("vol_delta", names(coef(clinrad_mod))[-1])]
+    }
+    mod_i <-  lm(
+      formula=vol_delta~.,
+      data=df_train_i
+    )
+    t_i <- as.data.frame(summary(mod_i)$coefficients[,3])
+    t_i$model <- params_df$model[i]
+    t_i$variable <- rownames(t_i)
+    rownames(t_i) <- NULL
+    colnames(t_i)[1]<- "value"
+    return(t_i)
+  })
+  coef_t_df <- do.call(rbind.data.frame, coef_t_list)
+  coef_t_df <- coef_t_df[coef_t_df$variable!="(Intercept)",]
+  coef_t_df$variable <- 
+    c("Age", "T-Stage", "glcm_Correlation", "Pretreatment Volume")[
+      factor(coef_t_df$variable)
+    ]
+  coef_t_df$variable <- factor(coef_t_df$variable, levels=rev(c(
+    "Age", "T-Stage", "Pretreatment Volume", "glcm_Correlation"
+  )))
+  
+  coef_t_plot <- ggplot(coef_t_df, aes(x=variable, y=value))+
+    geom_hline(yintercept = 0, linetype=2)+
+    geom_boxplot(aes(colour=model))+
+    facet_wrap(model~.)+
+    coord_flip()+
+    theme(legend.position = "none")+
+    xlab("Variable")+
+    ylab("T-score")
+  ggsave(coef_t_plot,
+         filename = "figures/coef_t_plot.png",
+         width=6,
+         height=6,
+         dpi=600,
+         units = "in")
+  
+  
+  
+  
+  coefs_df2 <- coefs_df
+  rownames(coefs_df)<- NULL
+  coefs_df2 <- coefs_df2[coefs_df$variable!="(Intercept)",]
+  coefs_df2$variable <- c("Age", "T-Stage", "Volume", "Age", "T-Stage", "Volume", "firstorder_Maximum")
+  coefs_df2$variable <- factor(coefs_df2$variable, levels=rev(
+    c("Age", "T-Stage", "Volume", "firstorder_Maximum")))
+  coefs_df2$ci_lo <- coefs_df2$beta - 2*coefs_df2$sigma 
+  coefs_df2$ci_hi <- coefs_df2$beta + 2*coefs_df2$sigma
+  colnames(coefs_df2)[1] <- "Model"
+  
+  
+  coefs_plot <- ggplot(coefs_df2, aes(x=variable, y=beta))+
+    geom_hline(yintercept = 0, linetype=2, colour="red")+
+    geom_errorbar(aes(ymin=ci_lo, ymax=ci_hi), width=0.2)+
+    
+    geom_point(aes(y=beta, colour=Model), size=2)+
+    facet_wrap(Model~., scales="free_y", nrow=2)+
+    coord_flip()+
+    scale_colour_manual(values=c("cyan2", "magenta2"))+
+    theme_bw()+
+    xlab("Variable")+
+    ylab("Coefficient")+
+    theme(legend.position = "none")
+  ggsave(coefs_plot,
+         filename = "figures/model_coefs.png",
+         width=5,
+         height=6,
+         dpi=600,
+         units = "in")
+  
+}
+
+#img acq param summaries
+if(T){
+  
+  #image characteristics
+  all_data$acq_Scanner_Manufacturer_fac <- fac2(all_data$acq_scanner_manufacturer)
+  all_data$acq_kernel[all_data$kernel%in%c("2", "3", "b", "c")]<- "other"
+  all_data$acq_kernel[!all_data$acq_kernel %in% names(sort(-table(all_data$acq_kernel)))[1:5]]<- "other"
+  all_data$acq_Kernel_fac <- fac2(all_data$acq_kernel)
+  all_data$acq_XR_Current_fac <- as.character(cut(as.numeric(all_data$acq_xr_current),
+                                                  breaks=c(0, 200, 500, 1000), dig.lab = 5))
+  all_data$acq_XR_Current_fac[is.na(all_data$acq_XR_Current_fac)] <- "unknown"
+  all_data$acq_XR_Current_fac <- fac2(all_data$acq_XR_Current_fac)
+  all_data$acq_kVp_fac <- fac2(as.numeric(all_data$acq_kvp))
+  all_data$acq_Exposure_Time_fac <- as.numeric(all_data$acq_exposure_time)
+  all_data$acq_Exposure_Time_fac <- as.character(cut(all_data$acq_Exposure_Time_fac,
+                                                     breaks=c(0, 400, 800, 1200), dig.lab = 5))
+  all_data$acq_Exposure_Time_fac[is.na(all_data$acq_Exposure_Time_fac)]<- "unknown"
+  all_data$acq_Exposure_Time_fac <- fac2(all_data$acq_Exposure_Time_fac)
+  all_data$acq_Exposure_fac <- as.character(cut(as.numeric(all_data$acq_exposure),
+                                                breaks=c(0, 100, 200, 300, Inf), dig.lab = 5))
+  all_data$acq_Exposure_fac[is.na(all_data$acq_Exposure_fac)] <- "unknown"
+  all_data$acq_Exposure_fac <- fac2(all_data$acq_Exposure_fac)
+  all_data$acq_Voxel_Width_fac <- as.character(cut(as.numeric(all_data$acq_voxel_dim),
+                                                   breaks=c(0.5, 0.7, 0.9, 1), dig.lab = 5))
+  all_data$acq_Voxel_Width_fac[is.na(all_data$acq_Voxel_Width_fac)] <- "unknown"
+  all_data$acq_Voxel_Width_fac <- factor(all_data$acq_Voxel_Width_fac)
+  all_data$partition <- all_data$centre %in% train_centres
+  
+  extract_summaries <- function(all_data, table_type="participant"){
+    
+    summary_vars <- grep("_fac$", colnames(all_data), value=T)
+    if(table_type=="acq"){
+      summary_vars <- summary_vars[grepl("^acq_", summary_vars)]
+    }else{
+      all_data <- all_data[!duplicated(all_data$patient_id),]
+      summary_vars <- summary_vars[!grepl("^acq_", summary_vars)]
+    }
+    summary_list <- lapply(summary_vars, function(summary_var_i){
+      
+      tbl_i <- table(as.data.frame(all_data[,c( summary_var_i, "partition")]))
+      if("unavailable" %in% rownames(tbl_i)){
+        tbl_i <- tbl_i[c(which(rownames(tbl_i)!="unavailable"),
+                         which(rownames(tbl_i)=="unavailable")),]
+      }
+      test_i <- ""# fisher.test(tbl_i)
+      tbl_i[] <- paste0(tbl_i, " (", 100*round(t(t(tbl_i)/colSums(tbl_i)), 2), ")")
+      tbl_i <- cbind(rownames(tbl_i), tbl_i)
+      mat_i <- matrix("", nrow(tbl_i)+1, 5)
+      mat_i[-1,2:4]<- tbl_i
+      mat_i[1]<- gsub("_fac", "", summary_var_i)
+      mat_i[nrow(mat_i),5]<-""
+      return(mat_i)
+    })
+    summary_list <- do.call(rbind, summary_list)
+    colnames(summary_list)<- c("Variable", "Value", "Train", "Validation", "P-value")
+    return(summary_list)
+    
+  }
+  image_parameter_summaries <- extract_summaries(all_data, table_type="acq")
+  write.csv(image_parameter_summaries,
+            "tables/image_parameter_summaries.csv",
+            row.names = F)
+}
+
+#partial corr analysis
+if(T){
+  df_i <- rbind(df_train, df_test)
+  df_i <- cbind(vol_delta=c(df_list$Train$vol_delta, df_list$Test$vol_delta),
+                df_i)
+  #df_i$vol_delta <- c(df_list$Train$vol_delta, df_list$Test$vol_delta)
+  df_i <- as.matrix(sapply(df_i, rank))
+  bs_pcors <- lapply(1:1000, function(bs_i){
+    
+    bs_idx <- sample(nrow(df_i), replace=T)
+    ds_GL_mod <- SILGGM(df_i[bs_idx,], method="D-S_GL")
+    Pcor_traintest_i <- ds_GL_mod$partialCor
+    return(Pcor_traintest_i)
+    
+  })
+  bs_pcors <- abind(bs_pcors, along=3)
+  bs_pcors_m <- round(apply(bs_pcors, c(1,2), mean),2)
+  bs_pcors_lo <- round(apply(bs_pcors, c(1,2), function(i) quantile(i, probs = 0.025)),2)
+  bs_pcors_hi <- round(apply(bs_pcors, c(1,2), function(i) quantile(i, probs = 0.975)),2)
+  bs_pcors <- bs_pcors[,,1]
+  bs_pcors[] <- paste0(bs_pcors_m, " [", bs_pcors_lo, ",", bs_pcors_hi, "]")
+  
+  dimnames(bs_pcors) <- rep(list(
+    colnames(df_i)
+  ), 2)
+  write.csv(bs_pcors, file = 'tables/pcors.csv')
+}
+
+#save image
+if(T){
+  save.image("data_image_02_12_23.RData")
+}
